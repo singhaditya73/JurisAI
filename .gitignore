@@ -10,9 +10,11 @@ build/
 
 # Virtual Environment
 venv/
+venv_wsl/
 env/
 .env
 unsloth_env/
+unsloth_compiled_cache/
 
 # IDE
 .vscode/

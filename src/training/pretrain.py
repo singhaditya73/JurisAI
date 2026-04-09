@@ -17,6 +17,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Import unsloth FIRST for optimizations
+import unsloth
+
 from rich.console import Console
 
 console = Console()
@@ -29,8 +32,7 @@ def run_pretraining(skip_if_exists: bool = False) -> str:
         Path to the saved adapter directory.
     """
     from datasets import load_dataset
-    from trl import SFTTrainer
-    from transformers import TrainingArguments
+    from trl import SFTTrainer, SFTConfig
     from unsloth import FastLanguageModel
     
     from src.data.data_utils import load_config
@@ -81,35 +83,34 @@ def run_pretraining(skip_if_exists: bool = False) -> str:
     # Step 3: Configure trainer
     console.print("\n[bold]Step 3: Configuring trainer...[/bold]")
     
-    training_arguments = TrainingArguments(
+    sft_config = SFTConfig(
         output_dir=output_dir,
         num_train_epochs=pretrain_args.get("num_train_epochs", 1),
         per_device_train_batch_size=pretrain_args.get("per_device_train_batch_size", 1),
         gradient_accumulation_steps=pretrain_args.get("gradient_accumulation_steps", 8),
         learning_rate=pretrain_args.get("learning_rate", 2e-4),
         lr_scheduler_type=pretrain_args.get("lr_scheduler_type", "cosine"),
-        warmup_ratio=pretrain_args.get("warmup_ratio", 0.03),
+        warmup_steps=pretrain_args.get("warmup_steps", 50),
         weight_decay=pretrain_args.get("weight_decay", 0.01),
         max_grad_norm=pretrain_args.get("max_grad_norm", 1.0),
-        fp16=pretrain_args.get("fp16", True),
-        bf16=pretrain_args.get("bf16", False),
+        fp16=False,
+        bf16=True,
         logging_steps=pretrain_args.get("logging_steps", 10),
         save_steps=pretrain_args.get("save_steps", 200),
         save_total_limit=pretrain_args.get("save_total_limit", 2),
         dataloader_num_workers=pretrain_args.get("dataloader_num_workers", 2),
         dataloader_pin_memory=pretrain_args.get("dataloader_pin_memory", True),
-        report_to="tensorboard",
-        logging_dir=str(PROJECT_ROOT / "logs" / "pretrain"),
+        dataset_text_field=pretrain_args.get("dataset_text_field", "text"),
+        max_seq_length=pretrain_args.get("max_seq_length", 2048),
+        packing=False,
+        report_to="none",
     )
     
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=dataset,
-        args=training_arguments,
-        dataset_text_field=pretrain_args.get("dataset_text_field", "text"),
-        max_seq_length=pretrain_args.get("max_seq_length", 2048),
-        packing=False,  # Disable to save VRAM on 4GB card
+        args=sft_config,
     )
     
     # Step 4: Train

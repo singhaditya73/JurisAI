@@ -19,6 +19,9 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Import unsloth FIRST for optimizations
+import unsloth
+
 from rich.console import Console
 
 console = Console()
@@ -77,8 +80,7 @@ def run_finetuning(
     """
     import json
     from datasets import load_dataset, DatasetDict
-    from trl import SFTTrainer
-    from transformers import TrainingArguments
+    from trl import SFTTrainer, SFTConfig
     from unsloth import FastLanguageModel
     
     from src.data.data_utils import load_config
@@ -162,7 +164,7 @@ def run_finetuning(
     inst_config = data_config.get("instruction_format", {})
     system_prompt = inst_config.get("system_prompt", "You are JurisAI, an expert Indian legal assistant.")
     
-    training_arguments = TrainingArguments(
+    sft_config = SFTConfig(
         output_dir=output_dir,
         num_train_epochs=sft_args.get("num_train_epochs", 3),
         per_device_train_batch_size=sft_args.get("per_device_train_batch_size", 1),
@@ -170,11 +172,11 @@ def run_finetuning(
         gradient_accumulation_steps=sft_args.get("gradient_accumulation_steps", 8),
         learning_rate=sft_args.get("learning_rate", 2e-4),
         lr_scheduler_type=sft_args.get("lr_scheduler_type", "cosine"),
-        warmup_ratio=sft_args.get("warmup_ratio", 0.05),
+        warmup_steps=sft_args.get("warmup_steps", 50),
         weight_decay=sft_args.get("weight_decay", 0.01),
         max_grad_norm=sft_args.get("max_grad_norm", 1.0),
-        fp16=sft_args.get("fp16", True),
-        bf16=sft_args.get("bf16", False),
+        fp16=False,
+        bf16=True,
         logging_steps=sft_args.get("logging_steps", 10),
         save_steps=sft_args.get("save_steps", 100),
         save_total_limit=sft_args.get("save_total_limit", 3),
@@ -186,64 +188,48 @@ def run_finetuning(
         neftune_noise_alpha=sft_args.get("neftune_noise_alpha", 5),
         dataloader_num_workers=sft_args.get("dataloader_num_workers", 2),
         dataloader_pin_memory=sft_args.get("dataloader_pin_memory", True),
-        report_to="tensorboard",
-        logging_dir=str(PROJECT_ROOT / "logs" / "instruct"),
+        max_seq_length=sft_args.get("max_seq_length", 2048),
+        packing=sft_args.get("packing", False),
+        report_to="none",
     )
     
-    # Determine if data has 'messages' or 'instruction' format
-    sample = train_dataset[0]
-    has_messages = "messages" in sample
-    
-    if has_messages:
-        # Pre-formatted ChatML — use formatting function
-        def _formatting_func(examples):
-            return formatting_func(examples, tokenizer, system_prompt)
-        
-        trainer = SFTTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            args=training_arguments,
-            formatting_func=_formatting_func,
-            max_seq_length=sft_args.get("max_seq_length", 2048),
-            packing=sft_args.get("packing", False),
-        )
-    else:
-        # Raw instruction format — use dataset_text_field
-        # We need to format on-the-fly
-        def _format_row(row):
+    # Convert all data to text field using chat template
+    def _format_row(row):
+        # Handle 'messages' format (pre-formatted ChatML)
+        if "messages" in row:
+            messages = row["messages"]
+        else:
+            # Convert from instruction/input/output format
             instruction = row.get("instruction", "")
             inp = row.get("input", "")
             output = row.get("output", "")
-            
             user_msg = f"{instruction}\n\n{inp}".strip() if inp else instruction
-            
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
                 {"role": "assistant", "content": output},
             ]
-            
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False,
-            )
-            return {"text": text}
         
-        train_dataset = train_dataset.map(_format_row, remove_columns=train_dataset.column_names)
-        if eval_dataset:
-            eval_dataset = eval_dataset.map(_format_row, remove_columns=eval_dataset.column_names)
-        
-        trainer = SFTTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            args=training_arguments,
-            dataset_text_field="text",
-            max_seq_length=sft_args.get("max_seq_length", 2048),
-            packing=sft_args.get("packing", False),
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False,
         )
+        return {"text": text}
+    
+    console.print("  Formatting data with chat template...")
+    train_dataset = train_dataset.map(_format_row, remove_columns=train_dataset.column_names)
+    if eval_dataset:
+        eval_dataset = eval_dataset.map(_format_row, remove_columns=eval_dataset.column_names)
+    console.print(f"[green]  ✓ Formatted {len(train_dataset):,} training examples[/green]")
+    
+    sft_config.dataset_text_field = "text"
+    
+    trainer = SFTTrainer(
+        model=model,
+        processing_class=tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        args=sft_config,
+    )
     
     # Step 4: Train!
     console.print("\n[bold]Step 4: Starting instruction fine-tuning...[/bold]")
@@ -257,7 +243,14 @@ def run_finetuning(
     
     print_gpu_info()
     
-    trainer_stats = trainer.train()
+    # Check for existing checkpoints to resume from
+    resume_from = None
+    checkpoint_dirs = sorted(Path(output_dir).glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
+    if checkpoint_dirs:
+        resume_from = str(checkpoint_dirs[-1])
+        console.print(f"[yellow]  ⚡ Resuming from {resume_from}[/yellow]")
+    
+    trainer_stats = trainer.train(resume_from_checkpoint=resume_from)
     
     # Step 5: Save adapter
     console.print("\n[bold]Step 5: Saving fine-tuned adapter...[/bold]")
